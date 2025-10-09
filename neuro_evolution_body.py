@@ -40,8 +40,7 @@ def make_robot(genotype):
     #     robot_graph,
     #     DATA / "robot_graph.json",
     # )
-
-    return construct_mjspec_from_graph(robot_graph)
+    return robot_graph
 
 
 def init_population(population: int):
@@ -57,7 +56,53 @@ def init_population(population: int):
 
     return res
 
-def parent_selection(x, f):
+from concurrent.futures import ProcessPoolExecutor, as_completed
+
+
+def evaluate_single_robot(index, robot_genotype):
+    print(f"Processing robot {index + 1} ...")
+    
+    graph = make_robot(robot_genotype)
+    robot_core_func = lambda: construct_mjspec_from_graph(graph)
+    
+    robot_fitness = evolve_robot_controller(
+        robot_core_func=robot_core_func,
+        world_func=OlympicArena,
+        spawn_pos=[-0.8, -0, 0.1],
+        time=30,
+        population=10,
+        p_crossover=0.5,
+        m_rate=0.5,
+        generations=1
+    )
+    
+    print(f"Finished robot {index + 1}")
+    return index, robot_fitness
+
+
+def evaluate_population(population, max_workers=4):
+    results = [None] * len(population)
+    
+    with ProcessPoolExecutor(max_workers=max_workers) as executor:
+        futures = {
+            executor.submit(evaluate_single_robot, i, robot_genotype): i
+            for i, robot_genotype in enumerate(population)
+        }
+        
+        for future in as_completed(futures):
+            i = futures[future]
+            try:
+                index, fitness = future.result()
+                results[index] = fitness
+            except Exception as e:
+                print(f"Error evaluating robot {i + 1}: {e}")
+                results[i] = None
+                
+    print("✅ All robots processed.")
+    return results
+
+
+def parent_selection(population, f):
     x_parents, f_parents = [],[]
     
     total_f              = np.sum(f)
@@ -66,15 +111,15 @@ def parent_selection(x, f):
     max_probs            = np.array([i / (total_f + s) for i in f])    
     min_probs            = 1 / (max_probs + s)
     min_probs_normalized = min_probs / (min_probs.sum() + s)
-    
-    for _ in range(int(len(x)/2)):
-        parent_indices = np.random.choice(len(x), size=2, replace=True, p=min_probs_normalized)
-        x_parents.append([x[i] for i in parent_indices])
+    for _ in range(int(len(population)/2)):
+        parent_indices = np.random.choice(len(population), size=2, replace=True, p=min_probs_normalized)
+        x_parents.append([population[i] for i in parent_indices])
         f_parents.append([f[i] for i in parent_indices])
 
     return x_parents, f_parents
 
-def crossover(x_parents, p_crossover):
+
+def crossover_basic(x_parents, p_crossover):
     offspring = []
     for pair in x_parents:
         if np.random.random() > p_crossover:
@@ -82,35 +127,39 @@ def crossover(x_parents, p_crossover):
             continue
         
         p1, p2 = pair
+        p1, p2 = p1.copy(), p2.copy()
         
         # 1) Get crossover points
-        crossover_point_1 = np.random.randint(0,int(len(p1)))
-        crossover_point_2 = np.random.randint(crossover_point_1,len(p1))
+        crossover_point = np.random.randint(0,int(len(p1)))
         
-        # 2) Generate two offsprings, px represents parent of which we get the strand from. the remaining gene we get from p2
-        for px, py in [(p1,p2),(p2,p1)]:
-            strand_1 = px[crossover_point_1:crossover_point_2]
-            
-            new_baby = list(py[:crossover_point_1]) + list(strand_1) + list(py[crossover_point_2:])
-            print(len(p1), len(new_baby))
-            offspring.append(np.array(new_baby))
+        _temp = p1[crossover_point]
+        p1[crossover_point] = p2[crossover_point]
+        p2[crossover_point] = _temp
 
-
+        offspring.append(p1)
+        offspring.append(p2)
 
     offspring = np.array(offspring)
     return offspring
 
-def mutate(x, mutation_rate):
+def crossover(x_parents, p_crossover, crossover_mode = "BASIC"):
+    if crossover_mode == "BASIC":
+        return crossover_basic(x_parents, p_crossover)
+
+    return crossover_basic(x_parents, p_crossover)
+
+def mutate(population, mutation_rate):
     """Apply mutation to an individual."""
 
-    for i in x:
-        for a in range(len(i)):
-            if np.random.random() > mutation_rate:
-                continue
+    for gene in population:
+        for strand in gene:
+            for i in range(len(strand)):
+                if np.random.random() > mutation_rate:
+                    continue
+                
+                strand[i] = np.random.random() # TODO: Switch with another index instead
 
-            i[a] = np.random.uniform(low=-np.pi/2, high=np.pi/2)
-
-    return x
+    return population
 
 def survivior_selection(x, f, x_offspring, f_offspring):
     """Select the survivors, for the population of the next generation. Returns a list of survivors and their fitness values."""
@@ -138,22 +187,6 @@ def survivior_selection(x, f, x_offspring, f_offspring):
 
     return x, f
 
-def evaluate_population(population):
-    res = []
-    for robot_genotype in population:
-        robot_core_func = lambda : make_robot(robot_genotype)
-
-        robot_fitness = evolve_robot_controller(robot_core_func = robot_core_func, 
-                                                world_func      = OlympicArena, 
-                                                spawn_pos       = [-0.8, -0, 0.1],
-                                                time            = 30,
-                                                population      = 10,
-                                                p_crossover     = 0.5,
-                                                m_rate          = 0.5)
-        
-        res.append(robot_fitness)
-    return res
-
 def store_best(population, population_fitness, x_best, f_best):
     idx = np.argmin(population_fitness) # !!! SWITCHED FROM .argmax() to .argmin() FOR MINIMIZATION !!!
     xi_best = population[idx]
@@ -166,15 +199,17 @@ def store_best(population, population_fitness, x_best, f_best):
         x_best.append(x_best[-1])
         f_best.append(f_best[-1])
 
-def main(time = 30, n_population = 10, generations = 50, p_crossover = 0.5, m_rate = 0.1):
+def main(n_population = 10, generations = 50, p_crossover = 0.5, m_rate = 0.1):
     population         = init_population(n_population)
     population_fitness = evaluate_population(population)
 
-    idx = np.argmin(population_fitness) 
+    idx              = np.argmin(population_fitness) 
     x0_best, f0_best = population[idx],  population_fitness[idx]
     x_best,  f_best  = [x0_best], [f0_best]
 
     for _ in range(generations):
+        print(f"============= Generation {_ + 1} =============")
+
         parents, parents_f             = parent_selection(population, population_fitness)
         offsprings                     = crossover(parents, p_crossover)
         offsprings                     = mutate(offsprings, m_rate)

@@ -1,10 +1,8 @@
 # Third-party libraries
 import mujoco
 import numpy as np
-from ariel.simulation.environments.simple_flat_world import SimpleFlatWorld
 from ariel.simulation.tasks.gate_learning import xy_displacement
-from ariel.simulation.environments import OlympicArena
-
+import ctypes
 
 def init_genome(input_size, hidden_size, output_size):
     # Flattened [input→hidden, hidden bias, hidden→output, output bias]
@@ -68,7 +66,6 @@ def evaluate(population, robot_core_func, world_func, time, input_size, hidden_s
         distance_to_goal = xy_displacement((pos_data[-1, 0], pos_data[-1, 1]), (0.0, -0.3))
             
         results_fitness.append(distance_to_goal)
-        print(f"Finished genome {i+1}, distance to goal: {distance_to_goal}")
         
     return results_fitness
 
@@ -107,7 +104,6 @@ def crossover(x_parents, p_crossover):
             strand_1 = px[crossover_point_1:crossover_point_2]
             
             new_baby = list(py[:crossover_point_1]) + list(strand_1) + list(py[crossover_point_2:])
-            print(len(p1), len(new_baby))
             offspring.append(np.array(new_baby))
 
 
@@ -184,7 +180,6 @@ def main(robot_core_func,
     f_best = [f0_best]
 
     for _ in range(generations):
-        print(len(population))
         parents, parents_f             = parent_selection(population, population_fitness)
         offsprings                     = crossover(parents, p_crossover)
         
@@ -197,12 +192,13 @@ def main(robot_core_func,
         idx = np.argmin(population_fitness) # !!! SWITCHED FROM .argmax() to .argmin() FOR MINIMIZATION !!!
         xi_best = population[idx]
         fi_best = population_fitness[idx]
-        print(f"Best one is {fi_best}")
         if fi_best < f_best[-1]: # !!! SWITCHED FROM > to < FOR MINIMIZATION !!!
             x_best.append(xi_best)
             f_best.append(fi_best)
         else:
             x_best.append(x_best[-1])
             f_best.append(f_best[-1])
+
+            
     
     return f_best[-1]
