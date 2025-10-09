@@ -1,21 +1,11 @@
 # Third-party libraries
-from ariel.simulation.environments.rugged_heightmap import RuggedTerrainWorld
-import matplotlib.pyplot as plt
 import mujoco
 import numpy as np
-from mujoco import viewer
-
-# import prebuilt robot phenotypes
-from ariel.body_phenotypes.robogen_lite.prebuilt_robots.gecko import gecko
 from ariel.simulation.environments.simple_flat_world import SimpleFlatWorld
-# Local libraries
 from ariel.simulation.tasks.gate_learning import xy_displacement
-from ariel.utils.renderers import video_renderer
-from ariel.utils.video_recorder import VideoRecorder
+from ariel.simulation.environments import OlympicArena
 
-from neuro_evolution_body import make_random_robot
 
-# --- Neural Network utils ---
 def init_genome(input_size, hidden_size, output_size):
     # Flattened [input→hidden, hidden bias, hidden→output, output bias]
     n_params = input_size*hidden_size + hidden_size + hidden_size*output_size + output_size
@@ -45,7 +35,6 @@ def forward_nn(x, genome, input_size, hidden_size, output_size):
     o = np.tanh(np.dot(h, w2) + b2)
     return o
 
-
 def nn_control(model, data, to_track, genome, history, input_size, hidden_size, output_size):
     # Example state: joint positions + velocities
     qvel = data.qvel  # joint velocities
@@ -57,62 +46,14 @@ def nn_control(model, data, to_track, genome, history, input_size, hidden_size, 
     data.ctrl = np.clip(data.ctrl, -np.pi/2, np.pi/2)
     history.append(to_track[0].xpos.copy())
 
-
-def genome_move(model, data, to_track, genome, timestep, history) -> None:
-    """
-    Applies joint commands from a pre-generated genome.
-    
-    The genome is a list of lists, where each inner list is a set of
-    commands for one timestep.
-    """
-    delta = 0.05
-    time_step = int(data.time / 0.002)
-    data.ctrl += genome[time_step] * delta 
-    data.ctrl = np.clip(data.ctrl, -np.pi/2, np.pi/2)
-
-    history.append(to_track[0].xpos.copy())
-
-def random_move(model, data, to_track, history) -> None:
-    """Generate random movements for the robot's joints.
-    
-    The mujoco.set_mjcb_control() function will always give 
-    model and data as inputs to the function. Even if you don't use them,
-    you need to have them as inputs.
-
-    Parameters
-    ----------
-
-    model : mujoco.MjModel
-        The MuJoCo model of the robot.
-    data : mujoco.MjData
-        The MuJoCo data of the robot.
-
-    Returns
-    -------
-    None
-        This function modifies the data.ctrl in place.
-    """
-
-    num_joints = model.nu 
-    
-    hinge_range = np.pi/2
-    rand_moves = np.random.uniform(low= -hinge_range, # -pi/2
-                                   high=hinge_range, # pi/2
-                                   size=num_joints) 
-    print(rand_moves)
-
-    delta = 0.05
-    data.ctrl += rand_moves * delta 
-    data.ctrl = np.clip(data.ctrl, -np.pi/2, np.pi/2)
-    history.append(to_track[0].xpos.copy())
-
-def create_population(model, num_steps, population):
-    return [[np.random.uniform(low=-np.pi/2, high=np.pi/2, size=model.nu) for _ in range(num_steps)] for _ in range(population)]
-
-def evaluate(population, model, world, time, input_size, hidden_size, output_size):
+def evaluate(population, robot_core_func, world_func, time, input_size, hidden_size, output_size):
     results_fitness = []
     for i, genome in enumerate(population):
-        data = mujoco.MjData(model)
+        mujoco.set_mjcb_control(None)
+        world       = world_func()
+        world.spawn(robot_core_func().spec, spawn_position=[0, 0, 0])
+        model       = world.spec.compile()
+        data        = mujoco.MjData(model)
 
         geoms = world.spec.worldbody.find_all(mujoco.mjtObj.mjOBJ_GEOM)
         to_track = [data.bind(geom) for geom in geoms if "core" in geom.name]
@@ -130,7 +71,6 @@ def evaluate(population, model, world, time, input_size, hidden_size, output_siz
         print(f"Finished genome {i+1}, distance to goal: {distance_to_goal}")
         
     return results_fitness
-
 
 def parent_selection(x, f):
     x_parents, f_parents = [],[]
@@ -175,10 +115,9 @@ def crossover(x_parents, p_crossover):
     offspring = np.array(offspring)
     return offspring
 
-
 def mutate(x, mutation_rate):
     """Apply mutation to an individual."""
-    # 1) Go through the population
+
     for i in x:
         for a in range(len(i)):
             if np.random.random() > mutation_rate:
@@ -187,7 +126,6 @@ def mutate(x, mutation_rate):
             i[a] = np.random.uniform(low=-np.pi/2, high=np.pi/2)
 
     return x
-
 
 def survivior_selection(x, f, x_offspring, f_offspring):
     """Select the survivors, for the population of the next generation. Returns a list of survivors and their fitness values."""
@@ -216,13 +154,18 @@ def survivior_selection(x, f, x_offspring, f_offspring):
     return x, f
 
 
+def main(robot_core_func, 
+         world_func, 
+         spawn_pos      = [-0.8, 0, 0.1], 
+         time           = 30, 
+         population     = 10, 
+         generations    = 50, 
+         p_crossover    = 0.5, 
+         m_rate         = 0.1):
 
-def main(time = 30, population = 10, generations = 50, p_crossover = 0.5, m_rate = 0.1):
     mujoco.set_mjcb_control(None)
-    world       = SimpleFlatWorld()
-    gecko_core, genotype  = make_random_robot()
-    
-    world.spawn(gecko_core.spec, spawn_position=[0, 0, 0])
+    world       = world_func()
+    world.spawn(robot_core_func().spec, spawn_position=spawn_pos)
     model       = world.spec.compile()
     data        = mujoco.MjData(model)
 
@@ -230,10 +173,8 @@ def main(time = 30, population = 10, generations = 50, p_crossover = 0.5, m_rate
     hidden_size = 16
     output_size = model.nu
 
-    # init population of NN genomes
     population  = [init_genome(input_size, hidden_size, output_size) for _ in range(population)]
-    population_fitness = evaluate(population, model, world, time, input_size, hidden_size, output_size)
-
+    population_fitness = evaluate(population, robot_core_func, world_func, time, input_size, hidden_size, output_size)
 
     idx = np.argmin(population_fitness) 
     x0_best = population[idx]
@@ -248,7 +189,7 @@ def main(time = 30, population = 10, generations = 50, p_crossover = 0.5, m_rate
         offsprings                     = crossover(parents, p_crossover)
         
         offsprings                     = mutate(offsprings, m_rate)
-        f_offspring                    = evaluate(offsprings, model, world, time, input_size, hidden_size, output_size)
+        f_offspring                    = evaluate(offsprings, robot_core_func, world_func, time, input_size, hidden_size, output_size)
         population, population_fitness = survivior_selection(
             parents, parents_f, offsprings, f_offspring
         )
@@ -264,4 +205,4 @@ def main(time = 30, population = 10, generations = 50, p_crossover = 0.5, m_rate
             x_best.append(x_best[-1])
             f_best.append(f_best[-1])
     
-    return x_best, f_best, genotype
+    return f_best[-1]
