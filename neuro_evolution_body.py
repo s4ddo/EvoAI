@@ -103,16 +103,36 @@ def evaluate_population(population, max_workers=4):
 
 
 def parent_selection(population, f):
-    x_parents, f_parents = [],[]
+    """Selects parents from the population based on their fitness."""
+    x_parents, f_parents = [], []
     
-    total_f              = np.sum(f)
+    # Convert fitness list to a numpy array for easier calculations
+    fitness_values = np.array(f)
     
-    s                    = 0.000000000001
-    max_probs            = np.array([i / (total_f + s) for i in f])    
-    min_probs            = 1 / (max_probs + s)
-    min_probs_normalized = min_probs / (min_probs.sum() + s)
-    for _ in range(int(len(population)/2)):
-        parent_indices = np.random.choice(len(population), size=2, replace=True, p=min_probs_normalized)
+    # Since this is a minimization problem (lower fitness is better), we transform
+    # the fitness scores so that lower scores get a higher probability.
+    # We subtract each score from the max score to invert the ranking.
+    max_fitness = np.max(fitness_values)
+    
+    # Add a small epsilon to ensure even the worst-performing individual (transformed score of 0)
+    # has a tiny, non-zero chance of being selected.
+    s = 1e-9 
+    
+    # Transformed fitness: The best (lowest) original scores are now the highest values.
+    transformed_fitness = (max_fitness - fitness_values) + s
+    
+    # Normalize the positive, transformed fitness scores to get valid probabilities.
+    probabilities = transformed_fitness / np.sum(transformed_fitness)
+
+    # Loop to select pairs of parents
+    for _ in range(int(len(population) / 2)):
+        # Use the new, valid probabilities for selection
+        parent_indices = np.random.choice(
+            len(population), 
+            size=2, 
+            replace=True, 
+            p=probabilities
+        )
         x_parents.append([population[i] for i in parent_indices])
         f_parents.append([f[i] for i in parent_indices])
 
