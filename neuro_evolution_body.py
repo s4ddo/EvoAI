@@ -76,7 +76,7 @@ def evaluate_single_robot(index, robot_genotype):
         generations=1
     )
     
-    print(f"Finished robot {index + 1}")
+    print(f"Finished robot {index + 1} with fitness : {robot_fitness}")
     return index, robot_fitness
 
 

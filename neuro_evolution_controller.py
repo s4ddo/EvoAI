@@ -1,41 +1,60 @@
 # Third-party libraries
 import mujoco
 import numpy as np
-from ariel.simulation.tasks.gate_learning import xy_displacement
+from ariel.simulation.tasks.gait_learning import xy_displacement
 import ctypes
+import matplotlib.pyplot as plt
+
 
 def init_genome(input_size, hidden_size, output_size):
-    # Flattened [input→hidden, hidden bias, hidden→output, output bias]
-    n_params = input_size*hidden_size + hidden_size + hidden_size*output_size + output_size
+    hidden1_size = hidden2_size = hidden_size
+    n_params = (
+        input_size * hidden1_size + hidden1_size + 
+        hidden1_size * hidden2_size + hidden2_size + 
+        hidden2_size * output_size + output_size
+    )
     return np.random.uniform(-1, 1, size=n_params)
 
+
 def decode_genome(genome, input_size, hidden_size, output_size):
-    """Turn flat genome into weights and biases."""
+    """Turn flat genome into weights and biases for 2 hidden layers."""
+
+    hidden1_size = hidden2_size = hidden_size
+
     idx = 0
-    
-    # input→hidden
-    w1 = genome[idx: idx + input_size*hidden_size].reshape(input_size, hidden_size)
-    idx += input_size*hidden_size
-    b1 = genome[idx: idx + hidden_size]
-    idx += hidden_size
 
-    # hidden→output
-    w2 = genome[idx: idx + hidden_size*output_size].reshape(hidden_size, output_size)
-    idx += hidden_size*output_size
-    b2 = genome[idx: idx + output_size]
+    # input → hidden1
+    w1 = genome[idx: idx + input_size * hidden1_size].reshape(input_size, hidden1_size)
+    idx += input_size * hidden1_size
+    b1 = genome[idx: idx + hidden1_size]
+    idx += hidden1_size
 
-    return (w1, b1, w2, b2)
+    # hidden1 → hidden2
+    w2 = genome[idx: idx + hidden1_size * hidden2_size].reshape(hidden1_size, hidden2_size)
+    idx += hidden1_size * hidden2_size
+    b2 = genome[idx: idx + hidden2_size]
+    idx += hidden2_size
+
+    # hidden2 → output
+    w3 = genome[idx: idx + hidden2_size * output_size].reshape(hidden2_size, output_size)
+    idx += hidden2_size * output_size
+    b3 = genome[idx: idx + output_size]
+
+    return (w1, b1, w2, b2, w3, b3)
+
 
 def forward_nn(x, genome, input_size, hidden_size, output_size):
-    """Simple 1-hidden-layer NN with tanh activation."""
-    w1, b1, w2, b2 = decode_genome(genome, input_size, hidden_size, output_size)
-    h = np.tanh(np.dot(x, w1) + b1)
-    o = np.tanh(np.dot(h, w2) + b2)
+    """2-hidden-layer NN: tanh activations for hidden layers, linear output."""
+
+    w1, b1, w2, b2, w3, b3 = decode_genome(genome, input_size, hidden_size, output_size)
+    h1 = np.tanh(np.dot(x, w1) + b1)
+    h2 = np.tanh(np.dot(h1, w2) + b2)
+    o = np.tanh(np.dot(h2, w3) + b3 ) # linear output (no activation)
     return o
 
 def nn_control(model, data, to_track, genome, history, input_size, hidden_size, output_size):
     # Example state: joint positions + velocities
-    qvel = data.qvel  # joint velocities
+    qvel = data.qpos  # joint velocities
 
     action = forward_nn(qvel, genome, input_size, hidden_size, output_size)
     
@@ -44,30 +63,67 @@ def nn_control(model, data, to_track, genome, history, input_size, hidden_size, 
     data.ctrl = np.clip(data.ctrl, -np.pi/2, np.pi/2)
     history.append(to_track[0].xpos.copy())
 
-def evaluate(population, robot_core_func, world_func, time, input_size, hidden_size, output_size):
+from multiprocessing import Pool, cpu_count
+
+# --- helper function for pool (must be top-level) ---
+def _evaluate_star(args):
+    return evaluate_one(*args)
+
+
+def fitness_function(target_position, history: list[tuple[float, float, float]]) -> float:
+    xt, yt, zt = target_position
+    xc, yc, zc = history[-1]
+
+    cartesian_distance = np.sqrt(
+        (xt - xc) ** 2 + (yt - yc) ** 2 + (zt - zc) ** 2,
+    )
+
+    return cartesian_distance
+
+import time as t
+def evaluate_one(genome, robot_core_func, world_func, time, input_size, hidden_size, output_size, spawn_pos):
+    mujoco.set_mjcb_control(None)
+    world = world_func()
+    world.spawn(robot_core_func().spec, spawn_pos)
+    model = world.spec.compile()
+    data = mujoco.MjData(model)
+
+    geoms = world.spec.worldbody.find_all(mujoco.mjtObj.mjOBJ_GEOM)
+    to_track = [data.bind(geom) for geom in geoms if "core" in geom.name]
+
+    history = []
+    mujoco.set_mjcb_control(
+        lambda m, d: nn_control(m, d, to_track, genome, history, input_size, hidden_size, output_size)
+    )
+
+    start_time = t.time()
+
+    while data.time < time: # and (t.time() - start_time) < 15:
+        mujoco.mj_step(model, data)
+
+    distance_to_goal = fitness_function([5,0,0.5], history)
+    return distance_to_goal
+
+
+def evaluate(population, robot_core_func, world_func, time, input_size, hidden_size, output_size, spawn_pos, n_workers=None):
+    if n_workers is None:
+        n_workers = min(len(population), cpu_count() - 1)
+
     results_fitness = []
-    for i, genome in enumerate(population):
-        mujoco.set_mjcb_control(None)
-        world       = world_func()
-        world.spawn(robot_core_func().spec, spawn_position=[0, 0, 0])
-        model       = world.spec.compile()
-        data        = mujoco.MjData(model)
+    total = len(population)
 
-        geoms = world.spec.worldbody.find_all(mujoco.mjtObj.mjOBJ_GEOM)
-        to_track = [data.bind(geom) for geom in geoms if "core" in geom.name]
+    with Pool(n_workers) as pool:
+        args = [
+            (genome, robot_core_func, world_func, time, input_size, hidden_size, output_size, spawn_pos)
+            for genome in population
+        ]
 
-        history = []
-        mujoco.set_mjcb_control(lambda m,d: nn_control(m, d, to_track, genome, history, input_size, hidden_size, output_size))
+        for i, result in enumerate(pool.imap_unordered(_evaluate_star, args), 1):
+            results_fitness.append(result)
+            print(f"Processed genome {i}/{total}. Fitness: {result}")
 
-        while data.time < time:
-            mujoco.mj_step(model, data)
-
-        pos_data = np.array(history)
-        distance_to_goal = xy_displacement((pos_data[-1, 0], pos_data[-1, 1]), (0.0, -0.3))
-            
-        results_fitness.append(distance_to_goal)
-        
     return results_fitness
+
 
 def parent_selection(x, f):
     x_parents, f_parents = [],[]
@@ -119,7 +175,7 @@ def mutate(x, mutation_rate):
             if np.random.random() > mutation_rate:
                 continue
 
-            i[a] = np.random.uniform(low=-np.pi/2, high=np.pi/2)
+            i[a] += np.random.normal(-0.1,0.1)
 
     return x
 
@@ -149,6 +205,14 @@ def survivior_selection(x, f, x_offspring, f_offspring):
 
     return x, f
 
+def graph_results(progress, title="Progress"):
+    plt.figure(figsize=(10, 6))
+    plt.title(title)
+    plt.plot(progress, 'm-', label='Progress Towards Target')
+    plt.ylabel("Progress")
+    plt.ylim(bottom = 0)
+    plt.legend()
+    plt.grid(True)
 
 def main(robot_core_func, 
          world_func, 
@@ -157,22 +221,27 @@ def main(robot_core_func,
          population     = 10, 
          generations    = 50, 
          p_crossover    = 0.5, 
-         m_rate         = 0.1):
+         m_rate         = 0.1,
+         hidden_size    = 16,
+         graph          = False):
 
     mujoco.set_mjcb_control(None)
     world       = world_func()
-    world.spawn(robot_core_func().spec, spawn_position=spawn_pos)
+    world.spawn(robot_core_func().spec, spawn_pos)
     model       = world.spec.compile()
     data        = mujoco.MjData(model)
 
-    input_size  = len(data.qvel)  # e.g., 6 positions + 6 velocities  
-    hidden_size = 16
+    input_size  = len(data.qpos)  # e.g., 6 positions + 6 velocities  
+    hidden_size = hidden_size
     output_size = model.nu
 
     population  = [init_genome(input_size, hidden_size, output_size) for _ in range(population)]
-    population_fitness = evaluate(population, robot_core_func, world_func, time, input_size, hidden_size, output_size)
+    population_fitness = evaluate(population, robot_core_func, world_func, time, input_size, hidden_size, output_size, spawn_pos)
 
     idx = np.argmin(population_fitness) 
+
+    f_best_current = [population_fitness[idx]]
+
     x0_best = population[idx]
     f0_best = population_fitness[idx]
     
@@ -180,11 +249,13 @@ def main(robot_core_func,
     f_best = [f0_best]
 
     for _ in range(generations):
+        if _ % 5 == 0:
+            print(f"Generation {_}")
         parents, parents_f             = parent_selection(population, population_fitness)
         offsprings                     = crossover(parents, p_crossover)
         
         offsprings                     = mutate(offsprings, m_rate)
-        f_offspring                    = evaluate(offsprings, robot_core_func, world_func, time, input_size, hidden_size, output_size)
+        f_offspring                    = evaluate(offsprings, robot_core_func, world_func, time, input_size, hidden_size, output_size, spawn_pos)
         population, population_fitness = survivior_selection(
             parents, parents_f, offsprings, f_offspring
         )
@@ -192,6 +263,9 @@ def main(robot_core_func,
         idx = np.argmin(population_fitness) # !!! SWITCHED FROM .argmax() to .argmin() FOR MINIMIZATION !!!
         xi_best = population[idx]
         fi_best = population_fitness[idx]
+
+        f_best_current.append(fi_best)
+
         if fi_best < f_best[-1]: # !!! SWITCHED FROM > to < FOR MINIMIZATION !!!
             x_best.append(xi_best)
             f_best.append(fi_best)
@@ -199,6 +273,8 @@ def main(robot_core_func,
             x_best.append(x_best[-1])
             f_best.append(f_best[-1])
 
-            
+    if graph:
+        graph_results(f_best, "Best of all runs")
+        graph_results(f_best_current, "Best in each run")
     
-    return f_best[-1]
+    return x_best[-1],f_best[-1]
